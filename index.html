@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>FinControl Web</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8fafc; }
+        .sidebar-link.active { background-color: #1e293b; color: white; border-left: 4px solid #3b82f6; }
+        .sidebar-link { transition: all 0.2s; border-left: 4px solid transparent; }
+        .sidebar-link:hover { background-color: #1e293b; }
+        #modal { transition: opacity 0.3s; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+        .employee-hidden { display: none !important; }
+        .select-none { user-select: none; -webkit-user-select: none; }
+    </style>
+    
+    <script src="https://www.gstatic.com/firebasejs/10.8.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore-compat.js"></script>
+    
+    <script>
+        window.firebaseConfig = {
+          apiKey: "AIzaSyAgS_dAw7zgISlV0kkN8tc_8V1NBJbhBbM",
+          authDomain: "financial-notebook.firebaseapp.com",
+          databaseURL: "https://financial-notebook-default-rtdb.europe-west1.firebasedatabase.app",
+          projectId: "financial-notebook",
+          storageBucket: "financial-notebook.firebasestorage.app",
+          messagingSenderId: "317518901140",
+          appId: "1:317518901140:web:cf3847439ee5ccf6d92981"
+        };
+
+        window.db = null;
+        window.invoices = [];
+        window.currentView = 'dashboard';
+        window.editingId = null;
+        window.currentPhotoBase64 = null;
+
+        window.userProfile = {
+            userName: localStorage.getItem('fc_user_name') || '',
+            isEmployeeMode: localStorage.getItem('fc_is_employee') === 'true',
+            adminPin: localStorage.getItem('fc_admin_pin') || ''
+        };
+
+        window.settings = { default_currency: "UAH", doc_types: ["фактура", "товарний чек", "готівка"] };
+        const savedSettings = localStorage.getItem('fincontrol_settings');
+        if (savedSettings) window.settings = JSON.parse(savedSettings);
+
+        window.connectToFirebase = () => {
+            try {
+                if (!firebase.apps.length) firebase.initializeApp(window.firebaseConfig);
+                window.db = firebase.firestore();
+                document.getElementById('cloud-status').innerHTML = '🟢 В мережі';
+                document.getElementById('cloud-status').classList.replace('text-red-400', 'text-emerald-400');
+                
+                window.db.collection("invoices").onSnapshot((snapshot) => {
+                    window.invoices = [];
+                    snapshot.forEach((doc) => {
+                        let data = doc.data();
+                        data.id = doc.id;
+                        window.invoices.push(data);
+                    });
+                    applyEmployeeRestrictions();
+                    renderCurrentView();
+                });
+
+                window.db.collection("settings").doc("global").onSnapshot((docSnap) => {
+                    if (docSnap.exists) {
+                        window.settings = { ...window.settings, ...docSnap.data() };
+                        localStorage.setItem('fincontrol_settings', JSON.stringify(window.settings));
+                        renderCurrentView();
+                    }
+                });
+            } catch (e) { console.error(e); }
+        };
+
+        window.applyEmployeeRestrictions = () => {
+            const isEmp = window.userProfile.isEmployeeMode;
+            const menuItems = ['nav-income', 'nav-debts', 'nav-planned', 'nav-settings'];
+            
+            menuItems.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) isEmp ? el.classList.add('employee-hidden') : el.classList.remove('employee-hidden');
+            });
+
+            if (isEmp && ['income', 'debts', 'planned', 'settings'].includes(window.currentView)) {
+                switchView('expense');
+            }
+        };
+
+        // ТАЄМНЕ РОЗБЛОКУВАННЯ НАЛАШТУВАНЬ (Затиснути на 3 секунди)
+        let holdTimer;
+        window.startUnlock = () => {
+            if (!window.userProfile.isEmployeeMode) return; // Працює тільки якщо заблоковано
+            holdTimer = setTimeout(() => {
+                let pin = prompt("Введіть PIN-код адміністратора для розблокування:");
+                if (pin === window.userProfile.adminPin) {
+                    window.userProfile.isEmployeeMode = false;
+                    localStorage.setItem('fc_is_employee', 'false');
+                    document.getElementById('set-is-employee').checked = false;
+                    document.getElementById('pin-setup-block').style.display = 'none';
+                    alert("Налаштування розблоковано успішно!");
+                    applyEmployeeRestrictions();
+                    switchView('settings');
+                } else if (pin !== null) {
+                    alert("Невірний PIN-код!");
+                }
+            }, 3000);
+        };
+        window.cancelUnlock = () => { clearTimeout(holdTimer); };
+
+        window.generateUUID = () => {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        };
+
+        window.toggleMobileMenu = () => {
+            document.getElementById('sidebar').classList.toggle('-translate-x-full');
+            document.getElementById('mobile-overlay').classList.toggle('hidden');
+        };
+
+        window.switchView = (view) => {
+            window.currentView = view;
+            document.querySelectorAll('.sidebar-link').forEach(el => el.classList.remove('active'));
+            const activeNav = document.getElementById(`nav-${view}`);
+            if (activeNav) activeNav.classList.add('active');
+            
+            document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+            if(['income', 'expense', 'planned', 'debts'].includes(view)) {
+                document.getElementById('table-view').classList.remove('hidden');
+            } else {
+                document.getElementById(`${view}-view`).classList.remove('hidden');
+            }
+            renderCurrentView();
+
+            if (window.innerWidth < 768) {
+                document.getElementById('sidebar').classList.add('-translate-x-full');
+                document.getElementById('mobile-overlay').classList.add('hidden');
+            }
+        };
+
+        window.formatCurrency = (amount, currency) => {
+            const symbols = {"UAH": "₴", "USD": "$", "EUR": "€"};
+            return `${parseFloat(amount).toLocaleString('uk-UA', {minimumFractionDigits: 2})} ${symbols[currency] || currency}`;
+        };
+
+        window.renderCurrentView = () => {
+            if(window.currentView === 'dashboard') renderDashboard();
+            else if(['income', 'expense', 'planned', 'debts'].includes(window.currentView)) renderTable();
+            else if(window.currentView === 'settings') renderSettings();
+        };
+
+        window.renderDashboard = () => {
+            let cur = window.settings.default_currency;
+            document.getElementById('dash-currency').innerText = cur;
+            
+            let data = window.invoices;
+            if (window.userProfile.isEmployeeMode && window.userProfile.userName) {
+                data = data.filter(i => i.createdBy === window.userProfile.userName);
+            }
+
+            let income = data.filter(i => i.type === 'income' && i.status === 'paid' && (i.currency || 'UAH') === cur).reduce((s, i) => s + parseFloat(i.amount), 0);
+            let expense = data.filter(i => i.type === 'expense' && i.status === 'paid' && (i.currency || 'UAH') === cur).reduce((s, i) => s + parseFloat(i.amount), 0);
+            
+            document.getElementById('stat-balance').innerText = formatCurrency(income - expense, cur);
+            document.getElementById('stat-income').innerText = formatCurrency(income, cur);
+            document.getElementById('stat-expense').innerText = formatCurrency(expense, cur);
+            
+            const planCard = document.getElementById('dash-plan-card');
+            if (window.userProfile.isEmployeeMode) planCard.classList.add('hidden');
+            else {
+                planCard.classList.remove('hidden');
+                let planned = data.filter(i => i.type === 'planned' && (i.currency || 'UAH') === cur).reduce((s, i) => s + parseFloat(i.amount), 0);
+                document.getElementById('stat-planned').innerText = formatCurrency(planned, cur);
+            }
+        };
+
+        window.renderTable = () => {
+            const tbody = document.getElementById('table-body');
+            tbody.innerHTML = '';
+            
+            let titles = { 'income': '⬇️ Прихід', 'expense': '⬆️ Розхід', 'planned': '📅 Планування', 'debts': '💸 Борги' };
+            document.getElementById('table-title').innerText = titles[window.currentView];
+            
+            document.getElementById('btn-add-record').onclick = () => openModal(window.currentView);
+
+            let filtered = window.invoices.filter(i => {
+                if(window.currentView === 'debts') return i.type === 'debt_in' || i.type === 'debt_out';
+                return i.type === window.currentView;
+            });
+
+            if (window.userProfile.isEmployeeMode && window.userProfile.userName) {
+                filtered = filtered.filter(i => i.createdBy === window.userProfile.userName);
+            }
+
+            filtered.sort((a, b) => new Date(b.issueDate || 0) - new Date(a.issueDate || 0));
+
+            filtered.forEach(inv => {
+                let hasPhoto = inv.file_data ? '📸 ' : '';
+                let tr = document.createElement('tr');
+                tr.className = "border-b hover:bg-slate-50";
+                tr.innerHTML = `
+                    <td class="p-3 text-sm">${inv.issueDate || ''}</td>
+                    <td class="p-3 text-sm font-medium">${inv.number || ''}</td>
+                    <td class="p-3 text-sm">${inv.doc_type || ''}</td>
+                    <td class="p-3 text-sm"><b>${inv.partner || ''}</b><br><span class="text-xs text-slate-500">${hasPhoto}${inv.description || ''}</span></td>
+                    <td class="p-3 text-sm font-bold text-right">${parseFloat(inv.amount).toFixed(2)} ${inv.currency || 'UAH'}</td>
+                    <td class="p-3 text-sm text-center">
+                        <button onclick="openModal('${window.currentView}', '${inv.id}')" class="text-slate-500 mx-1"><i class="fas fa-edit"></i></button>
+                        <button onclick="deleteRecord('${inv.id}')" class="text-red-500 mx-1"><i class="fas fa-trash"></i></button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        };
+
+        window.saveRecord = async () => {
+            let amount = document.getElementById('form-amount').value;
+            let desc = document.getElementById('form-desc').value;
+            
+            if (!amount || !desc) return alert("Заповніть суму та опис!");
+
+            let record = {
+                id: window.editingId || generateUUID(),
+                number: document.getElementById('form-number').value,
+                doc_type: document.getElementById('form-doc-type').value || "товарний чек",
+                type: window.currentView,
+                partner: document.getElementById('form-partner').value || "З телефону",
+                description: desc,
+                amount: parseFloat(amount),
+                currency: document.getElementById('form-currency').value,
+                issueDate: document.getElementById('form-date').value,
+                status: 'unpaid',
+                createdBy: window.userProfile.userName || 'Адмін' 
+            };
+
+            if (window.currentPhotoBase64) record.file_data = window.currentPhotoBase64;
+            await window.db.collection("invoices").doc(record.id).set(record, {merge: true});
+            closeModal();
+        };
+
+        window.renderSettings = () => {
+            document.getElementById('set-user-name').value = window.userProfile.userName;
+            document.getElementById('set-is-employee').checked = window.userProfile.isEmployeeMode;
+            document.getElementById('set-admin-pin').value = window.userProfile.adminPin;
+            
+            document.getElementById('pin-setup-block').style.display = window.userProfile.isEmployeeMode ? 'block' : 'none';
+            
+            const adminTools = document.getElementById('admin-settings-tools');
+            window.userProfile.isEmployeeMode ? adminTools.classList.add('hidden') : adminTools.classList.remove('hidden');
+        };
+
+        window.saveLocalProfile = () => {
+            const name = document.getElementById('set-user-name').value;
+            const isEmp = document.getElementById('set-is-employee').checked;
+            const pin = document.getElementById('set-admin-pin').value;
+            
+            if (isEmp && (!pin || pin.length < 4)) {
+                alert("Будь ласка, введіть надійний PIN-код (мінімум 4 цифри) для блокування налаштувань!");
+                return;
+            }
+
+            localStorage.setItem('fc_user_name', name);
+            localStorage.setItem('fc_is_employee', isEmp);
+            localStorage.setItem('fc_admin_pin', pin);
+            
+            window.userProfile.userName = name;
+            window.userProfile.isEmployeeMode = isEmp;
+            window.userProfile.adminPin = pin;
+            
+            alert("Профіль збережено! Налаштування заблоковано.");
+            applyEmployeeRestrictions();
+            renderCurrentView();
+        };
+
+        window.handlePhotoSelect = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.readAsDataURL(file);
+            reader.onload = event => {
+                const img = new Image();
+                img.src = event.target.result;
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const MAX_WIDTH = 800;
+                    let width = img.width, height = img.height;
+                    if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
+                    canvas.width = width; canvas.height = height;
+                    canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+                    window.currentPhotoBase64 = canvas.toDataURL('image/jpeg', 0.5);
+                    document.getElementById('photo-label').innerText = "Фото готове! ✅";
+                }
+            }
+        };
+
+        window.openModal = (type, id = null) => {
+            window.editingId = id;
+            document.getElementById('modal').classList.remove('hidden');
+            window.currentPhotoBase64 = null;
+            document.getElementById('photo-label').innerText = "📸 Сфотографувати чек";
+            
+            const isQuick = type === 'expense' && !id;
+            document.getElementById('photo-block').classList.toggle('hidden', !isQuick);
+            document.getElementById('adv-fields').classList.toggle('hidden', isQuick);
+
+            if (id) {
+                let inv = window.invoices.find(i => i.id === id);
+                document.getElementById('form-desc').value = inv.description || '';
+                document.getElementById('form-amount').value = inv.amount;
+                document.getElementById('form-date').value = inv.issueDate;
+            } else {
+                document.getElementById('form-desc').value = '';
+                document.getElementById('form-amount').value = '';
+                document.getElementById('form-date').value = new Date().toISOString().split('T')[0];
+                document.getElementById('form-number').value = 'РОЗ-' + Math.floor(Math.random()*1000);
+            }
+        };
+
+        window.closeModal = () => document.getElementById('modal').classList.add('hidden');
+        window.deleteRecord = async (id) => { if(confirm("Видалити?")) await window.db.collection("invoices").doc(id).delete(); };
+        document.addEventListener('DOMContentLoaded', connectToFirebase);
+    </script>
+</head>
+<body class="flex flex-col md:flex-row h-screen overflow-hidden bg-slate-50">
+
+    <div class="md:hidden bg-slate-900 text-white p-4 flex justify-between items-center z-40">
+        <!-- Додано обробники для довгого натискання -->
+        <h1 class="text-xl font-bold text-blue-400 select-none cursor-pointer" 
+            onmousedown="startUnlock()" onmouseup="cancelUnlock()" onmouseleave="cancelUnlock()"
+            ontouchstart="startUnlock()" ontouchend="cancelUnlock()" ontouchcancel="cancelUnlock()">FinControl</h1>
+        <button onclick="toggleMobileMenu()" class="px-2"><i class="fas fa-bars text-2xl"></i></button>
+    </div>
+
+    <div id="mobile-overlay" onclick="toggleMobileMenu()" class="fixed inset-0 bg-black/50 z-40 hidden md:hidden"></div>
+
+    <div id="sidebar" class="w-64 bg-slate-900 text-white flex flex-col shadow-xl z-50 fixed inset-y-0 left-0 transform -translate-x-full transition-transform md:relative md:translate-x-0">
+        <div class="p-6 border-b border-slate-800 hidden md:block">
+            <!-- Додано обробники для довгого натискання -->
+            <h1 class="text-2xl font-bold text-blue-400 select-none cursor-pointer"
+                onmousedown="startUnlock()" onmouseup="cancelUnlock()" onmouseleave="cancelUnlock()"
+                ontouchstart="startUnlock()" ontouchend="cancelUnlock()" ontouchcancel="cancelUnlock()">FinControl</h1>
+            <p id="cloud-status" class="text-xs mt-1 text-red-400">🔴 Офлайн</p>
+        </div>
+        
+        <div class="flex-1 overflow-y-auto py-4">
+            <a href="#" id="nav-dashboard" onclick="switchView('dashboard')" class="sidebar-link active flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-chart-pie w-6"></i> Огляд</a>
+            <a href="#" id="nav-income" onclick="switchView('income')" class="sidebar-link flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-arrow-down w-6 text-emerald-400"></i> Прихід</a>
+            <a href="#" id="nav-expense" onclick="switchView('expense')" class="sidebar-link flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-arrow-up w-6 text-rose-400"></i> Розхід</a>
+            <a href="#" id="nav-debts" onclick="switchView('debts')" class="sidebar-link flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-hand-holding-usd w-6 text-yellow-400"></i> Борги</a>
+            <a href="#" id="nav-planned" onclick="switchView('planned')" class="sidebar-link flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-calendar-alt w-6 text-blue-400"></i> План</a>
+        </div>
+        <div class="p-4 border-t border-slate-800">
+            <a href="#" id="nav-settings" onclick="switchView('settings')" class="sidebar-link flex items-center px-6 py-4 md:py-3 text-slate-300"><i class="fas fa-cog w-6"></i> Налаштування</a>
+        </div>
+    </div>
+
+    <div class="flex-1 overflow-y-auto p-4 md:p-8">
+        <div id="dashboard-view" class="view-section">
+            <h2 class="text-2xl font-bold mb-4">Мій огляд</h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div class="bg-blue-50 p-4 rounded-xl border border-blue-100">
+                    <p class="text-xs text-slate-500 uppercase font-bold">Баланс (<span id="dash-currency"></span>)</p>
+                    <h3 id="stat-balance" class="text-2xl font-bold text-blue-800">0.00</h3>
+                </div>
+                <div id="dash-income-card" class="bg-emerald-50 p-4 rounded-xl border border-emerald-100">
+                    <p class="text-xs text-slate-500 uppercase font-bold">Прихід</p>
+                    <h3 id="stat-income" class="text-2xl font-bold text-emerald-700">0.00</h3>
+                </div>
+                <div class="bg-rose-50 p-4 rounded-xl border border-rose-100">
+                    <p class="text-xs text-slate-500 uppercase font-bold">Розхід</p>
+                    <h3 id="stat-expense" class="text-2xl font-bold text-rose-700">0.00</h3>
+                </div>
+                <div id="dash-plan-card" class="bg-amber-50 p-4 rounded-xl border border-amber-100">
+                    <p class="text-xs text-slate-500 uppercase font-bold">В планах</p>
+                    <h3 id="stat-planned" class="text-2xl font-bold text-amber-700">0.00</h3>
+                </div>
+            </div>
+        </div>
+
+        <div id="table-view" class="view-section hidden">
+            <div class="flex justify-between items-center mb-6">
+                <h2 id="table-title" class="text-2xl font-bold text-slate-800">Записи</h2>
+                <button id="btn-add-record" class="bg-blue-600 text-white px-6 py-2 rounded-xl shadow-lg">+ Додати</button>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-x-auto">
+                <table class="w-full text-left border-collapse min-w-[500px]">
+                    <thead class="bg-slate-100 text-slate-500 text-xs uppercase font-bold">
+                        <tr>
+                            <th class="p-4 border-b">Дата</th>
+                            <th class="p-4 border-b">№</th>
+                            <th class="p-4 border-b">Тип</th>
+                            <th class="p-4 border-b">Опис / Партнер</th>
+                            <th class="p-4 border-b text-right">Сума</th>
+                            <th class="p-4 border-b text-center">Дії</th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div id="settings-view" class="view-section hidden">
+            <h2 class="text-2xl font-bold mb-6">Налаштування</h2>
+            
+            <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 mb-6">
+                <h3 class="font-bold text-slate-700 mb-4 border-b pb-2">Мій Профіль</h3>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm text-slate-500 mb-1">Ім'я співробітника (автор записів):</label>
+                        <input type="text" id="set-user-name" placeholder="Наприклад: Олександр" class="w-full border p-2 rounded-lg">
+                    </div>
+                    
+                    <div class="flex items-center gap-3 bg-amber-50 p-3 rounded-t-lg border-b border-amber-100">
+                        <input type="checkbox" id="set-is-employee" class="w-5 h-5" onchange="document.getElementById('pin-setup-block').style.display = this.checked ? 'block' : 'none'">
+                        <label for="set-is-employee" class="text-sm font-bold text-amber-800 italic">Увімкнути "Режим Співробітника"</label>
+                    </div>
+                    
+                    <div id="pin-setup-block" class="bg-amber-50 p-3 rounded-b-lg" style="display: none;">
+                        <label class="block text-sm text-slate-500 mb-1">PIN-код для розблокування (цифри):</label>
+                        <input type="number" id="set-admin-pin" placeholder="Наприклад: 1234" class="w-full border p-2 rounded-lg">
+                        <p class="text-xs text-amber-700 mt-2">* Щоб повернутися в Налаштування потім, затисніть логотип "FinControl" на 3 секунди.</p>
+                    </div>
+
+                    <button onclick="saveLocalProfile()" class="w-full bg-slate-800 text-white py-2 rounded-xl mt-4">Зберегти профіль</button>
+                </div>
+            </div>
+
+            <div id="admin-settings-tools" class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                <h3 class="font-bold text-slate-700 mb-4 border-b pb-2">Глобальні налаштування</h3>
+                <div class="mb-4">
+                    <label class="block text-sm text-slate-500 mb-1">Валюта за замовчуванням:</label>
+                    <select id="set-currency" class="w-full border p-2 rounded-lg">
+                        <option value="UAH">UAH</option><option value="USD">USD</option><option value="EUR">EUR</option>
+                    </select>
+                </div>
+                <button onclick="saveSettings()" class="w-full bg-blue-600 text-white py-2 rounded-xl">Зберегти для всіх</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal" class="hidden fixed inset-0 bg-slate-900/50 z-50 flex justify-center items-end md:items-center backdrop-blur-sm">
+        <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl shadow-2xl p-6 relative">
+            <button onclick="closeModal()" class="absolute top-4 right-4 text-slate-400"><i class="fas fa-times text-2xl"></i></button>
+            <h3 id="modal-title" class="text-xl font-bold mb-6">Новий запис</h3>
+            
+            <div class="space-y-4">
+                <div id="photo-block" class="hidden">
+                    <div onclick="document.getElementById('form-photo').click()" class="w-full py-6 border-2 border-dashed border-slate-300 rounded-xl text-center bg-slate-50">
+                        <i class="fas fa-camera text-2xl text-slate-400 mb-1"></i>
+                        <p id="photo-label" class="text-sm font-bold text-slate-500">📸 Сфотографувати чек</p>
+                    </div>
+                    <input type="file" id="form-photo" accept="image/*" capture="environment" class="hidden" onchange="handlePhotoSelect(event)">
+                </div>
+
+                <div id="adv-fields" class="grid grid-cols-2 gap-4">
+                    <input type="text" id="form-number" placeholder="№" class="border p-2 rounded-lg">
+                    <input type="text" id="form-doc-type" placeholder="Тип док." class="border p-2 rounded-lg">
+                    <input type="text" id="form-partner" placeholder="Партнер" class="col-span-2 border p-2 rounded-lg">
+                </div>
+
+                <input type="text" id="form-desc" placeholder="Що купили? (Опис)" class="w-full border p-3 rounded-xl font-medium">
+                
+                <div class="flex gap-2">
+                    <input type="number" id="form-amount" placeholder="Сума" class="flex-1 border p-3 rounded-xl text-xl font-bold text-rose-600">
+                    <select id="form-currency" class="border p-3 rounded-xl">
+                        <option value="UAH">UAH</option><option value="USD">USD</option><option value="EUR">EUR</option>
+                    </select>
+                </div>
+                <input type="date" id="form-date" class="w-full border p-3 rounded-xl">
+            </div>
+            <button onclick="saveRecord()" class="w-full bg-blue-600 text-white font-bold py-4 rounded-xl mt-6 shadow-lg text-lg">Відправити</button>
+        </div>
+    </div>
+
+</body>
+</html>
